@@ -1,0 +1,749 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>海底大冒险 · 凶鲨进化版</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            user-select: none;
+            -webkit-tap-highlight-color: transparent;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a1a2e;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+        }
+
+        .game-container {
+            box-shadow: 0 20px 35px rgba(0,0,0,0.6), 0 0 0 3px #e6cba0, 0 0 0 8px #6b4c2c;
+            border-radius: 28px;
+            background: #000;
+        }
+
+        canvas {
+            display: block;
+            margin: 0 auto;
+            cursor: none;
+            border-radius: 24px;
+        }
+
+        .info-tip {
+            position: fixed;
+            bottom: 18px;
+            left: 22px;
+            color: #fef0cf;
+            background: rgba(0,0,0,0.65);
+            padding: 6px 18px;
+            font-size: 14px;
+            border-radius: 40px;
+            font-family: monospace;
+            pointer-events: none;
+            backdrop-filter: blur(4px);
+            letter-spacing: 1px;
+            border-left: 4px solid #ffbc6e;
+            font-weight: bold;
+            z-index: 1000;
+        }
+
+        .film-grain {
+            pointer-events: none;
+            position: fixed;
+            top:0; left:0;
+            width:100%; height:100%;
+            background: repeating-radial-gradient(circle at 30% 40%, rgba(70,50,30,0.12) 1px, transparent 2px, transparent 4px);
+            mix-blend-mode: multiply;
+            z-index: 999;
+            animation: grainShift 0.6s infinite;
+        }
+        @keyframes grainShift {
+            0% { opacity: 0.35; }
+            100% { opacity: 0.55; }
+        }
+    </style>
+</head>
+<body>
+<div class="game-container">
+    <canvas id="gameCanvas" width="1400" height="800"></canvas>
+</div>
+<div class="info-tip">🐟 WASD/方向键 | 吃小鱼变大 | 躲鲨鱼&障碍物(即死) | 自动存档关卡</div>
+<div class="film-grain"></div>
+
+<script>
+    (function(){
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        const WIDTH = 1400, HEIGHT = 800;
+        const WORLD_WIDTH = 5200, WORLD_HEIGHT = 5200;
+        let camera = { x: 0, y: 0 };
+
+        let gameState = 'MENU'; // MENU, PLAYING, GAMEOVER
+        let currentLevel = 1;
+        let totalScore = 0;
+
+        // 主角体型成长 (吃小鱼增大)
+        let playerScale = 1.0;
+        const MAX_SCALE = 2.2;
+        const MIN_SCALE = 0.9;
+
+        let unlockSkins = [true, false, false, false];
+        let currentSkin = 0;
+        const skinNames = ["绯红游侠", "蓝白浪刃", "海盗鬼面", "黄金帝皇"];
+
+        const levelScoreGoal = [220, 480, 850];   // 各关目标分数
+        let shieldActive = false;
+        let speedBoostActive = false;
+        let speedBoostTimer = 0;
+        let shieldTimer = 0;
+        let invincibleTimer = 0;
+        const invincibleFrames = 48;
+
+        let levelStartTipTimer = 0;      // 关卡提示倒计时
+        let deathSaveTriggered = false;   // 死亡时存档标记
+
+        // 实体池
+        let enemies = [];        // 凶猛鲨鱼
+        let harmlessFish = [];   // 可食用小鱼
+        let treasures = [];       // 宝箱
+        let powerups = [];        // 道具
+        let obstacles = [];       // 障碍物 (碰到即死)
+        let bubbles = [];
+
+        const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false, w: false, s: false, a: false, d: false };
+
+        let player = {
+            x: WORLD_WIDTH/2, y: WORLD_HEIGHT/2,
+            baseRadius: 24,
+            speed: 4.3,
+            baseSpeed: 4.3,
+            angle: 0,
+            finWave: 0
+        };
+
+        // 辅助函数
+        function clamp(v,min,max){ return Math.min(max,Math.max(min,v)); }
+        function setShadow(b=8,c="rgba(0,0,0,0.5)"){ ctx.shadowBlur=b; ctx.shadowColor=c; }
+        function resetShadow(){ ctx.shadowBlur=0; ctx.shadowColor="transparent"; }
+
+        // ========== 差异化关卡背景 ==========
+        function drawSeaBackground(level){
+            let grad;
+            if(level===1){
+                grad = ctx.createLinearGradient(0,0,0,HEIGHT);
+                grad.addColorStop(0,"#1a78b8");
+                grad.addColorStop(1,"#093a60");
+            } else if(level===2){
+                grad = ctx.createLinearGradient(0,0,0,HEIGHT);
+                grad.addColorStop(0,"#2b8d7c");
+                grad.addColorStop(1,"#0e3b3a");
+            } else {
+                grad = ctx.createLinearGradient(0,0,0,HEIGHT);
+                grad.addColorStop(0,"#3a4a88");
+                grad.addColorStop(1,"#121f42");
+            }
+            ctx.fillStyle=grad;
+            ctx.fillRect(0,0,WIDTH,HEIGHT);
+
+            // 动态阳光光束
+            for(let i=0;i<14;i++){
+                ctx.beginPath();
+                ctx.moveTo(80+i*120,-20);
+                ctx.lineTo(220+i*100,HEIGHT+40);
+                ctx.lineTo(40+i*110,HEIGHT+40);
+                ctx.fillStyle=`rgba(240,250,210,${0.06+Math.sin(Date.now()*0.001+i)*0.03})`;
+                ctx.fill();
+            }
+        }
+
+        // ========== 凶残鲨鱼建模（独特凶猛，画风统一但压迫感强）==========
+        function drawShark(x,y,angle,typeShark){
+            ctx.save();
+            ctx.translate(x,y);
+            ctx.rotate(angle);
+            setShadow(10);
+            
+            let scaleMul = 1.0;
+            let bodyColor = "#2e4a5c";
+            let finColor = "#1a3342";
+            if(typeShark === 'giant') scaleMul = 1.6;
+            else if(typeShark === 'fast') scaleMul = 0.95;
+            else scaleMul = 1.25;
+            ctx.scale(scaleMul, scaleMul);
+            
+            // 强壮躯干
+            ctx.fillStyle = bodyColor;
+            ctx.beginPath();
+            ctx.moveTo(42,0);
+            ctx.quadraticCurveTo(22,-24,-34,-14);
+            ctx.quadraticCurveTo(-48,0,-34,14);
+            ctx.quadraticCurveTo(22,24,42,0);
+            ctx.fill();
+            
+            // 巨大镰刀状背鳍
+            ctx.fillStyle = finColor;
+            ctx.beginPath();
+            ctx.moveTo(12,-16);
+            ctx.lineTo(28,-44);
+            ctx.lineTo(40,-14);
+            ctx.fill();
+            
+            // 标志性三角形尾鳍 (大型)
+            ctx.fillStyle = "#264653";
+            ctx.beginPath();
+            ctx.moveTo(-38,-12);
+            ctx.lineTo(-68,0);
+            ctx.lineTo(-38,12);
+            ctx.fill();
+            
+            // 腹部浅色
+            ctx.fillStyle = "#6d8f9c";
+            ctx.beginPath();
+            ctx.ellipse(6,9,28,14,0,0,Math.PI*2);
+            ctx.fill();
+            
+            // 血红色眼眶 + 凶猛瞳孔
+            ctx.fillStyle = "#a11f1f";
+            ctx.beginPath();
+            ctx.ellipse(26,-9,7,9,0,0,Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = "#000000";
+            ctx.beginPath();
+            ctx.arc(28,-9,4,0,Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = "#ff4d4d";
+            ctx.beginPath();
+            ctx.arc(29.5,-10.5,1.8,0,Math.PI*2);
+            ctx.fill();
+            ctx.fillStyle = "#ffffff";
+            ctx.beginPath();
+            ctx.arc(30.5,-11.5,0.8,0,Math.PI*2);
+            ctx.fill();
+            
+            // 尖牙矩阵
+            ctx.fillStyle = "#f5f3e9";
+            for(let t=0; t<6; t++){
+                ctx.beginPath();
+                ctx.moveTo(34 - t*4, -3);
+                ctx.lineTo(38 - t*4, 5);
+                ctx.lineTo(29 - t*4, 3);
+                ctx.fill();
+            }
+            
+            // 伤疤 (增加凶狠感)
+            ctx.beginPath();
+            ctx.moveTo(-8,-8);
+            ctx.lineTo(0,-15);
+            ctx.lineTo(8,-8);
+            ctx.fillStyle = "#52332a";
+            ctx.fill();
+            
+            resetShadow();
+            ctx.restore();
+        }
+
+        // ========== 主角小鱼（可吃小鱼变大） ==========
+        function drawPlayerFish(x,y,angle,skinId,finSwing){
+            ctx.save();
+            ctx.translate(x,y);
+            ctx.rotate(angle);
+            ctx.scale(playerScale, playerScale);
+            setShadow(6);
+            
+            let bodyColor, stripeColor;
+            if(skinId===0){ bodyColor="#e55a3c"; stripeColor="#ffaa77"; }
+            else if(skinId===1){ bodyColor="#488bc2"; stripeColor="#e2f0ff"; }
+            else if(skinId===2){ bodyColor="#4b3524"; stripeColor="#cbad7a"; }
+            else{ bodyColor="#f7cf5c"; stripeColor="#ffd966"; }
+            
+            // 流线身体
+            ctx.beginPath();
+            ctx.moveTo(28,0);
+            ctx.quadraticCurveTo(16,-18,-20,-12);
+            ctx.quadraticCurveTo(-28,0,-20,12);
+            ctx.quadraticCurveTo(16,18,28,0);
+            ctx.fillStyle = bodyColor;
+            ctx.fill();
+            
+            // 动态鳍
+            ctx.beginPath(); ctx.moveTo(8,-14); ctx.quadraticCurveTo(14,-22+finSwing*1.6,22,-12); ctx.fillStyle = bodyColor; ctx.fill();
+            ctx.beginPath(); ctx.moveTo(8,14); ctx.quadraticCurveTo(14,22-finSwing*1.6,22,12); ctx.fill();
+            
+            // 三角形尾巴
+            ctx.beginPath();
+            ctx.moveTo(-24,-7);
+            ctx.lineTo(-44,0);
+            ctx.lineTo(-24,7);
+            ctx.fillStyle = stripeColor;
+            ctx.fill();
+            
+            // 眼睛
+            ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.ellipse(19,-5,5,6,0,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle = "#1e2a2a"; ctx.beginPath(); ctx.arc(20,-5,2.6,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(21.5,-6.5,1.2,0,Math.PI*2); ctx.fill();
+            
+            resetShadow();
+            ctx.restore();
+        }
+
+        // 可食用小鱼 (无害，被吃后变大)
+        function drawHarmlessFish(x,y,angle,color,size){
+            ctx.save();
+            ctx.translate(x,y);
+            ctx.rotate(angle);
+            ctx.scale(size,size);
+            setShadow(3);
+            ctx.fillStyle=color;
+            ctx.beginPath();
+            ctx.ellipse(0,0,14,9,0,0,Math.PI*2);
+            ctx.fill();
+            ctx.beginPath();
+            ctx.moveTo(-12,-4);
+            ctx.lineTo(-22,0);
+            ctx.lineTo(-12,4);
+            ctx.fill();
+            ctx.fillStyle="#fff";
+            ctx.beginPath(); ctx.arc(7,-2,2,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle="#000";
+            ctx.beginPath(); ctx.arc(7,-2,1.2,0,Math.PI*2); ctx.fill();
+            resetShadow();
+            ctx.restore();
+        }
+
+        // 障碍物和场景元素（保留写实感）
+        function drawRock(x,y,s){
+            ctx.save(); setShadow(9);
+            ctx.fillStyle="#5c6e4a";
+            ctx.beginPath(); ctx.ellipse(x,y,s*0.95,s*0.75,0,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle="#7f9a5e";
+            ctx.beginPath(); ctx.ellipse(x-4,y-3,s*0.3,s*0.25,0,0,Math.PI*2); ctx.fill();
+            resetShadow(); ctx.restore();
+        }
+        function drawCoral(x,y,t){
+            ctx.save(); setShadow(7);
+            let col = t===1?"#d97c5c":t===2?"#c76fa3":"#f5bc70";
+            ctx.fillStyle=col;
+            for(let i=0;i<5;i++){
+                ctx.beginPath();
+                ctx.moveTo(x,y);
+                ctx.quadraticCurveTo(x-8+i*3,y-20-i*2,x+2,y-32);
+                ctx.lineTo(x+4,y-22);
+                ctx.fill();
+            }
+            resetShadow(); ctx.restore();
+        }
+        function drawSeaweed(x,y,h,sway){
+            ctx.beginPath();
+            ctx.moveTo(x,y);
+            ctx.quadraticCurveTo(x+4+Math.sin(sway)*4,y-h*0.5,x-1+Math.cos(sway)*3,y-h);
+            ctx.lineTo(x+4,y-h+4);
+            ctx.fillStyle="#3e8741";
+            ctx.fill();
+        }
+        function drawShipWreck(x,y,r){
+            ctx.save(); ctx.translate(x,y); ctx.rotate(r); setShadow(8);
+            ctx.fillStyle="#6e472a"; ctx.fillRect(-42,-18,84,36);
+            ctx.fillStyle="#9b633e"; for(let i=0;i<4;i++) ctx.fillRect(-32+i*18,-24,14,48);
+            resetShadow(); ctx.restore();
+        }
+        function drawTreasureChest(x,y){
+            ctx.save(); setShadow(7);
+            ctx.fillStyle="#b57a42"; ctx.fillRect(x-18,y-16,36,32);
+            ctx.fillStyle="#e0ac6a"; ctx.fillRect(x-14,y-12,28,24);
+            ctx.fillStyle="#d4922b"; ctx.fillRect(x-6,y-20,12,10);
+            resetShadow(); ctx.restore();
+        }
+
+        // ========== 每关地图完全不同，难度递增，障碍物增多 ==========
+        function loadLevel(level){
+            enemies = [];
+            harmlessFish = [];
+            treasures = [];
+            powerups = [];
+            obstacles = [];
+            bubbles = [];
+            levelStartTipTimer = 100;   // 显示大号关卡提示
+            
+            // 1) 障碍物：随难度增加密度，碰到即死
+            let obsCount = level===1 ? 28 : (level===2 ? 48 : 70);
+            for(let i=0;i<obsCount;i++){
+                let typeRand = Math.random();
+                if(level===1){
+                    if(typeRand<0.7) obstacles.push({type:'rock', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, size:12+Math.random()*12});
+                    else obstacles.push({type:'coral', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, t:1});
+                } else if(level===2){
+                    if(typeRand<0.4) obstacles.push({type:'rock', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, size:15+Math.random()*14});
+                    else if(typeRand<0.7) obstacles.push({type:'coral', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, t:2});
+                    else obstacles.push({type:'wreck', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, r:Math.random()*Math.PI*2});
+                } else {
+                    if(typeRand<0.5) obstacles.push({type:'rock', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, size:18+Math.random()*15});
+                    else if(typeRand<0.8) obstacles.push({type:'coral', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, t:3});
+                    else obstacles.push({type:'wreck', x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, r:Math.random()*Math.PI*2});
+                }
+            }
+            
+            // 2) 宝箱
+            for(let i=0;i<7+level;i++){
+                treasures.push({x:200+Math.random()*(WORLD_WIDTH-400), y:200+Math.random()*(WORLD_HEIGHT-400), opened:false, gold:60+level*20});
+            }
+            
+            // 3) 道具 (金币/护盾/加速)
+            for(let i=0;i<25+level*5;i++){
+                let r=Math.random();
+                let type = r<0.5?'coin':(r<0.7?'shield':'speed');
+                powerups.push({x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT, type:type});
+            }
+            
+            // 4) 鲨鱼：数量更多，速度更快
+            let sharkCount = 3 + Math.floor(level * 1.8);
+            for(let i=0;i<sharkCount;i++){
+                let isGiant = (level>=3 && Math.random()<0.3);
+                let isFast = (level>=2 && Math.random()<0.6);
+                let sp = isFast ? 2.6 : (isGiant ? 1.0 : 1.5 + level*0.12);
+                enemies.push({
+                    x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT,
+                    speed: sp,
+                    type: isGiant?'giant':(isFast?'fast':'normal'),
+                    angle:0
+                });
+            }
+            
+            // 5) 可食用小鱼 (大量)
+            let fishColors = ["#f2873a","#5fb4e0","#ed9b5e","#f2c94c","#b27cbb"];
+            let fishCount = 65 + level * 12;
+            for(let i=0;i<fishCount;i++){
+                harmlessFish.push({
+                    x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT,
+                    vx:(Math.random()-0.5)*0.9, vy:(Math.random()-0.5)*0.9,
+                    color:fishColors[Math.floor(Math.random()*fishColors.length)],
+                    angle:0, size:0.6+Math.random()*0.6
+                });
+            }
+            
+            // 气泡氛围
+            for(let i=0;i<120;i++) bubbles.push({x:Math.random()*WORLD_WIDTH, y:Math.random()*WORLD_HEIGHT});
+        }
+        
+        // 存档当前关卡 (死亡时自动保存)
+        function saveCurrentProgress(){
+            localStorage.setItem("savedLevel", currentLevel);
+        }
+        
+        // 重置游戏（从存档关卡开始，或指定关卡）
+        function resetGameToLevel(lv){
+            currentLevel = lv;
+            totalScore = 0;
+            playerScale = 1.0;
+            player.x = WORLD_WIDTH/2;
+            player.y = WORLD_HEIGHT/2;
+            player.speed = 4.3;
+            player.baseSpeed = 4.3;
+            shieldActive = false;
+            speedBoostActive = false;
+            shieldTimer = 0;
+            speedBoostTimer = 0;
+            invincibleTimer = 0;
+            loadLevel(currentLevel);
+            deathSaveTriggered = false;
+        }
+        
+        // ========== 核心逻辑: 吃小鱼变大 + 障碍物即死 + 难度递增 ==========
+        function updateGame(){
+            if(gameState !== "PLAYING") return;
+            
+            // 移动
+            let mx=0, my=0;
+            if(keys.ArrowUp||keys.w) my--;
+            if(keys.ArrowDown||keys.s) my++;
+            if(keys.ArrowLeft||keys.a) mx--;
+            if(keys.ArrowRight||keys.d) mx++;
+            
+            if(mx!==0 || my!==0){
+                let len = Math.hypot(mx,my);
+                mx/=len; my/=len;
+                let sp = speedBoostActive ? player.baseSpeed*1.85 : player.baseSpeed;
+                player.x += mx*sp;
+                player.y += my*sp;
+                player.angle = Math.atan2(my,mx);
+            }
+            player.x = clamp(player.x, 50, WORLD_WIDTH-50);
+            player.y = clamp(player.y, 50, WORLD_HEIGHT-50);
+            player.finWave = (player.finWave+0.24) % (Math.PI*2);
+            
+            // 增益计时
+            if(invincibleTimer>0) invincibleTimer--;
+            if(shieldTimer>0){ shieldTimer--; if(shieldTimer<=0) shieldActive=false; }
+            if(speedBoostTimer>0){ speedBoostTimer--; if(speedBoostTimer<=0){ speedBoostActive=false; player.baseSpeed=4.3; } }
+            if(levelStartTipTimer>0) levelStartTipTimer--;
+            
+            // 鲨鱼追踪 (凶猛AI)
+            for(let i=0;i<enemies.length;i++){
+                let e = enemies[i];
+                let dx = player.x - e.x;
+                let dy = player.y - e.y;
+                let dist = Math.hypot(dx,dy);
+                if(dist>5){
+                    let move = e.speed;
+                    e.x += (dx/dist)*move;
+                    e.y += (dy/dist)*move;
+                }
+                e.angle = Math.atan2(dy,dx);
+                e.x = clamp(e.x,40,WORLD_WIDTH-40);
+                e.y = clamp(e.y,40,WORLD_HEIGHT-40);
+                
+                let currentRadius = player.baseRadius * playerScale;
+                if(dist < currentRadius + 28){
+                    if(!shieldActive && invincibleTimer<=0){
+                        // 死亡存档
+                        saveCurrentProgress();
+                        gameState = "GAMEOVER";
+                        return;
+                    } else if(shieldActive){
+                        shieldActive = false;
+                        shieldTimer = 0;
+                        invincibleTimer = 30;
+                    }
+                }
+            }
+            
+            // 吃小鱼 → 变大 + 加分
+            for(let i=0;i<harmlessFish.length;i++){
+                let f = harmlessFish[i];
+                f.x += f.vx;
+                f.y += f.vy;
+                if(f.x<30 || f.x>WORLD_WIDTH-30) f.vx*=-1;
+                if(f.y<30 || f.y>WORLD_HEIGHT-30) f.vy*=-1;
+                f.angle = Math.atan2(f.vy, f.vx);
+                
+                let distToPlayer = Math.hypot(player.x-f.x, player.y-f.y);
+                let playerRad = player.baseRadius * playerScale;
+                if(distToPlayer < playerRad + 12){
+                    harmlessFish.splice(i,1);
+                    i--;
+                    totalScore += 12;
+                    // 体型增大 (越吃越大)
+                    playerScale = Math.min(playerScale + 0.025, MAX_SCALE);
+                }
+            }
+            
+            // 宝箱收集
+            for(let i=0;i<treasures.length;i++){
+                let t = treasures[i];
+                if(!t.opened && Math.hypot(player.x-t.x, player.y-t.y) < player.baseRadius*playerScale+20){
+                    t.opened = true;
+                    totalScore += t.gold;
+                }
+            }
+            treasures = treasures.filter(t=>!t.opened);
+            
+            // 道具收集
+            for(let i=0;i<powerups.length;i++){
+                let p = powerups[i];
+                if(Math.hypot(player.x-p.x, player.y-p.y) < player.baseRadius*playerScale+16){
+                    if(p.type === 'coin') totalScore += 20;
+                    if(p.type === 'shield'){ shieldActive=true; shieldTimer=550; }
+                    if(p.type === 'speed'){ speedBoostActive=true; speedBoostTimer=480; player.baseSpeed=7.2; }
+                    powerups.splice(i,1); i--;
+                }
+            }
+            
+            // 障碍物碰撞 → 即死 (存档)
+            for(let i=0;i<obstacles.length;i++){
+                let obs = obstacles[i];
+                let obsRadius = obs.type==='wreck'?38 : (obs.type==='rock'? obs.size*0.7 : 18);
+                if(Math.hypot(player.x-obs.x, player.y-obs.y) < player.baseRadius*playerScale + obsRadius){
+                    if(!shieldActive && invincibleTimer<=0){
+                        saveCurrentProgress();
+                        gameState = "GAMEOVER";
+                        return;
+                    }
+                }
+            }
+            
+            // 通关判定 + 下一关明显提示 + 难度自然上升
+            if(totalScore >= levelScoreGoal[currentLevel-1]){
+                if(currentLevel < 3){
+                    currentLevel++;
+                    totalScore = 0;
+                    playerScale = 1.0;      // 重置体型，但解锁新皮肤
+                    // 皮肤解锁
+                    if(currentLevel===2) unlockSkins[1]=true;
+                    if(currentLevel===3) unlockSkins[2]=true;
+                    if(currentSkin < currentLevel) currentSkin = currentLevel-1;
+                    loadLevel(currentLevel);
+                    // 存档新关卡
+                    saveCurrentProgress();
+                } else {
+                    // 通关完成
+                    saveCurrentProgress();
+                    gameState = "GAMEOVER";
+                }
+            }
+            
+            // 相机跟随
+            camera.x = clamp(player.x - WIDTH/2, 0, WORLD_WIDTH-WIDTH);
+            camera.y = clamp(player.y - HEIGHT/2, 0, WORLD_HEIGHT-HEIGHT);
+        }
+        
+        // ========== 绘制所有世界元素 ==========
+        function drawWorld(){
+            drawSeaBackground(currentLevel);
+            ctx.save();
+            ctx.translate(-camera.x, -camera.y);
+            
+            // 障碍物
+            for(let obs of obstacles){
+                if(obs.type==='rock') drawRock(obs.x, obs.y, obs.size);
+                else if(obs.type==='coral') drawCoral(obs.x, obs.y, obs.t);
+                else if(obs.type==='wreck') drawShipWreck(obs.x, obs.y, obs.r);
+            }
+            
+            // 海草
+            for(let i=0;i<220;i++){
+                let sx = (i*173)%WORLD_WIDTH;
+                let sy = (i*269)%WORLD_HEIGHT;
+                drawSeaweed(sx, sy, 22+Math.sin(Date.now()*0.002+i)*5, Date.now()*0.007+i);
+            }
+            
+            // 宝箱
+            for(let t of treasures) drawTreasureChest(t.x, t.y);
+            
+            // 道具
+            for(let p of powerups){
+                if(p.type==='coin'){ ctx.fillStyle="#ffd966"; ctx.beginPath(); ctx.arc(p.x,p.y,9,0,Math.PI*2); ctx.fill(); ctx.fillStyle="#f7b32b"; ctx.fillRect(p.x-4,p.y-3,8,6);}
+                else if(p.type==='shield'){ ctx.fillStyle="#8ed9ff"; ctx.beginPath(); ctx.arc(p.x,p.y,13,0,Math.PI*2); ctx.fill(); ctx.fillStyle="#fff"; ctx.beginPath(); ctx.arc(p.x-4,p.y-4,3,0,Math.PI*2); ctx.fill();}
+                else if(p.type==='speed'){ ctx.fillStyle="#b3f0a0"; ctx.beginPath(); ctx.moveTo(p.x,p.y-12); ctx.lineTo(p.x+11,p.y); ctx.lineTo(p.x,p.y+12); ctx.lineTo(p.x-11,p.y); ctx.fill();}
+            }
+            
+            // 小鱼群
+            for(let f of harmlessFish) drawHarmlessFish(f.x,f.y,f.angle,f.color,f.size);
+            // 鲨鱼 (凶猛版)
+            for(let s of enemies) drawShark(s.x,s.y,s.angle,s.type);
+            // 主角
+            drawPlayerFish(player.x,player.y,player.angle,currentSkin,Math.sin(player.finWave)*3.5);
+            
+            // 气泡
+            for(let b of bubbles){
+                ctx.fillStyle = "rgba(230,248,255,0.65)";
+                ctx.beginPath(); ctx.arc(b.x,b.y,3+Math.random()*4,0,Math.PI*2); ctx.fill();
+            }
+            ctx.restore();
+        }
+        
+        // ========== UI界面：菜单、HUD、大字关卡提示、存档复活 ==========
+        function drawUI(){
+            if(gameState === "MENU"){
+                ctx.fillStyle="rgba(0,0,0,0.92)";
+                ctx.fillRect(0,0,WIDTH,HEIGHT);
+                ctx.font="bold 62px monospace";
+                ctx.fillStyle="#ffe3b5";
+                ctx.fillText("海底大冒险", WIDTH/2-180, 200);
+                ctx.font="34px monospace";
+                ctx.fillStyle="#ffda99";
+                ctx.fillText("▶ 开始新游戏", WIDTH/2-140, 360);
+                ctx.fillText("📀 从存档继续", WIDTH/2-140, 460);
+                
+                canvas.onclick = (e)=>{
+                    let rect=canvas.getBoundingClientRect();
+                    let mx=e.clientX-rect.left, my=e.clientY-rect.top;
+                    if(my>340 && my<400 && mx>WIDTH/2-140 && mx<WIDTH/2+140){
+                        resetGameToLevel(1);
+                        gameState="PLAYING";
+                    }
+                    if(my>440 && my<500 && mx>WIDTH/2-140 && mx<WIDTH/2+140){
+                        let saved = localStorage.getItem("savedLevel");
+                        if(saved){
+                            let lvl = parseInt(saved);
+                            resetGameToLevel(lvl);
+                            gameState="PLAYING";
+                        } else {
+                            resetGameToLevel(1);
+                            gameState="PLAYING";
+                        }
+                    }
+                };
+                return;
+            }
+            
+            // HUD 面板
+            ctx.fillStyle="rgba(0,0,0,0.55)";
+            ctx.fillRect(18,18,330,105);
+            ctx.fillStyle="#fffbe6";
+            ctx.font="bold 34px monospace";
+            ctx.fillText(`⭐ ${totalScore}`, 30, 65);
+            ctx.font="26px monospace";
+            ctx.fillText(`第 ${currentLevel} 关  | 体型: ${Math.floor(playerScale*10)/10}`, 30, 108);
+            
+            // 关卡大字提示 (醒目)
+            if(levelStartTipTimer > 0){
+                ctx.fillStyle="rgba(0,0,0,0.7)";
+                ctx.fillRect(0,0,WIDTH,HEIGHT);
+                ctx.font="bold 88px monospace";
+                ctx.fillStyle="#FFF3b0";
+                ctx.shadowBlur=0;
+                if(currentLevel===1) ctx.fillText("第一关 · 浅海试炼", WIDTH/2-240, HEIGHT/2);
+                else if(currentLevel===2) ctx.fillText("第二关 · 沉船凶影", WIDTH/2-240, HEIGHT/2);
+                else ctx.fillText("第三关 · 深渊死斗", WIDTH/2-220, HEIGHT/2);
+            }
+            
+            // 增益状态栏
+            if(shieldActive){
+                ctx.fillStyle="#2b6c8f"; ctx.fillRect(20,HEIGHT-55,160,38);
+                ctx.fillStyle="#fff"; ctx.fillText("🛡️ 护盾", 35, HEIGHT-25);
+            }
+            if(speedBoostActive){
+                ctx.fillStyle="#3c8f4a"; ctx.fillRect(200,HEIGHT-55,160,38);
+                ctx.fillStyle="#fff"; ctx.fillText("⚡ 加速", 215, HEIGHT-25);
+            }
+            
+            // GAME OVER 界面 (显示死亡存档信息)
+            if(gameState === "GAMEOVER"){
+                ctx.fillStyle="rgba(0,0,0,0.9)";
+                ctx.fillRect(0,0,WIDTH,HEIGHT);
+                ctx.font="bold 58px monospace";
+                ctx.fillStyle="#ffcf8a";
+                ctx.fillText("💀 葬身深海", WIDTH/2-170, 270);
+                ctx.font="32px monospace";
+                ctx.fillText(`最终得分: ${totalScore}`, WIDTH/2-130, 380);
+                ctx.fillText("从已存档关卡重新开始", WIDTH/2-210, 480);
+                ctx.fillText("点击任意位置", WIDTH/2-130, 560);
+                canvas.onclick = ()=>{
+                    let savedLvl = localStorage.getItem("savedLevel");
+                    let restartLvl = savedLvl ? parseInt(savedLvl) : 1;
+                    resetGameToLevel(restartLvl);
+                    gameState = "PLAYING";
+                };
+            }
+        }
+        
+        function animate(){
+            updateGame();
+            drawWorld();
+            drawUI();
+            requestAnimationFrame(animate);
+        }
+        
+        // 键盘监听
+        window.addEventListener("keydown",(e)=>{
+            if(keys.hasOwnProperty(e.key)) keys[e.key]=true;
+            e.preventDefault();
+        });
+        window.addEventListener("keyup",(e)=>{
+            if(keys.hasOwnProperty(e.key)) keys[e.key]=false;
+        });
+        
+        // 启动游戏
+        gameState = "MENU";
+        animate();
+    })();
+</script>
+</body>
+</html>
